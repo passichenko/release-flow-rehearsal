@@ -1,2 +1,3 @@
 first-disposable-candidate
 retry-after-pr-setting
+approval-before-validation-candidate-a
