@@ -1,0 +1,86 @@
+name: Candidate validation
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release-flow
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Candidate validation
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'candidate'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate exact candidate
+        env:
+          CANDIDATE: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ vars.REHEARSAL_VALIDATION_MODE }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          [[ $(git rev-parse HEAD) == "$CANDIDATE" ]]
+          staging=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" refs/heads/staging | awk '{print $1}')
+          [[ "$CANDIDATE" != "$staging" ]] || {
+            echo 'staging-only intermediate state fails closed'
+            exit 1
+          }
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
+          [[ $(jq -r '.head.sha' <<< "$pr") == "$CANDIDATE" ]]
+          body=$(jq -r '.body' <<< "$pr")
+          awk 'found { print } /<!-- release-notes -->/ { found=1 }' <<< "$body" > /tmp/pr-notes
+          git show "$CANDIDATE:.release-notes.md" > /tmp/candidate-notes
+          cmp /tmp/pr-notes /tmp/candidate-notes
+          receipt=$(git show "$CANDIDATE:.candidate.json")
+          source=$(jq -er '.source' <<< "$receipt")
+          base=$(jq -er '.base' <<< "$receipt")
+          [[ $(git rev-parse "$CANDIDATE^") == "$source" ]]
+          git merge-base --is-ancestor "$base" "$source"
+          case "${MODE:-success}" in
+            success) ;;
+            fail) echo 'requested disposable validation failure' >&2; exit 1 ;;
+            sleep) sleep 300 ;;
+            *) exit 1 ;;
+          esac
+
+  reconcile:
+    name: Reconcile after validation
+    needs: validate
+    if: needs.validate.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Configure automation identity
+        env:
+          KEY: ${{ secrets.REHEARSAL_DEPLOY_KEY }}
+        run: |
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$KEY" > "$HOME/.ssh/rehearsal"
+          chmod 0600 "$HOME/.ssh/rehearsal"
+          ssh-keyscan github.com > "$HOME/.ssh/known_hosts" 2>/dev/null
+          printf 'Host github.com\n  IdentityFile ~/.ssh/rehearsal\n  IdentitiesOnly yes\n' > "$HOME/.ssh/config"
+          git remote set-url origin "git@github.com:$GITHUB_REPOSITORY.git"
+      - name: Reconcile
+        env:
+          CANDIDATE: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          CHECK_NAME: Candidate validation
+          FAIL_AFTER: ${{ vars.REHEARSAL_FAIL_AFTER }}
+        run: scripts/reconcile.sh

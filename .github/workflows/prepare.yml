@@ -1,0 +1,88 @@
+name: Prepare candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      item:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-flow
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Configure automation identity
+        env:
+          KEY: ${{ secrets.REHEARSAL_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$KEY" > "$HOME/.ssh/rehearsal"
+          chmod 0600 "$HOME/.ssh/rehearsal"
+          ssh-keyscan github.com > "$HOME/.ssh/known_hosts" 2>/dev/null
+          printf 'Host github.com\n  IdentityFile ~/.ssh/rehearsal\n  IdentitiesOnly yes\n' > "$HOME/.ssh/config"
+          git remote set-url origin "git@github.com:$GITHUB_REPOSITORY.git"
+          git config user.name 'release-flow-rehearsal[bot]'
+          git config user.email 'release-flow-rehearsal@users.noreply.github.com'
+      - name: Prepare exact candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ITEM: ${{ inputs.item }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          base=$(git rev-parse origin/main)
+          if git ls-remote --exit-code --heads origin staging >/dev/null 2>&1; then
+            git fetch origin staging
+            git switch --force-create staging origin/staging
+          else
+            git switch --force-create staging origin/main
+          fi
+          printf '%s\n' "$ITEM" >> data/items.txt
+          git add data/items.txt
+          git commit -m "add: $ITEM"
+          source=$(git rev-parse HEAD)
+          git push origin "$source:refs/heads/staging"
+
+          old=$(git ls-remote origin refs/heads/candidate | awk '{print $1}')
+          if [[ -n "$old" ]]; then
+            git push --force-with-lease="refs/heads/candidate:$old" origin "$source:refs/heads/candidate"
+          else
+            git push origin "$source:refs/heads/candidate"
+          fi
+
+          git switch --force-create candidate "$source"
+          version=$(( $(<VERSION) + 1 ))
+          printf '%s\n' "$version" > VERSION
+          printf 'Release candidate %s for source %s.\n' "$version" "$source" > .release-notes.md
+          printf '{"base":"%s","source":"%s","version":%s}\n' "$base" "$source" "$version" > .candidate.json
+          printf '\n## %s\n\n- %s\n' "$version" "$ITEM" >> CHANGELOG.md
+          git add VERSION CHANGELOG.md .candidate.json .release-notes.md
+          git commit -m "release: $version"
+          candidate=$(git rev-parse HEAD)
+
+          {
+            printf '<!-- release-notes -->\n'
+            cat .release-notes.md
+          } > /tmp/pr-body.md
+          pr=$(gh pr list --head candidate --base main --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$pr" ]]; then
+            gh pr edit "$pr" --title "release: $version" --body-file /tmp/pr-body.md
+          fi
+
+          git push --force-with-lease="refs/heads/candidate:$source" origin "$candidate:refs/heads/candidate"
+          if [[ -z "$pr" ]]; then
+            gh pr create --draft --head candidate --base main --title "release: $version" --body-file /tmp/pr-body.md
+          fi

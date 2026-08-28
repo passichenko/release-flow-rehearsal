@@ -1,0 +1,76 @@
+name: Reconcile approved candidate
+
+on:
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        required: true
+        type: number
+      candidate_sha:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release-flow
+  cancel-in-progress: false
+
+jobs:
+  reconcile-review:
+    if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved' && github.event.pull_request.head.ref == 'candidate'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Configure automation identity
+        env:
+          KEY: ${{ secrets.REHEARSAL_DEPLOY_KEY }}
+        run: |
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$KEY" > "$HOME/.ssh/rehearsal"
+          chmod 0600 "$HOME/.ssh/rehearsal"
+          ssh-keyscan github.com > "$HOME/.ssh/known_hosts" 2>/dev/null
+          printf 'Host github.com\n  IdentityFile ~/.ssh/rehearsal\n  IdentitiesOnly yes\n' > "$HOME/.ssh/config"
+          git remote set-url origin "git@github.com:$GITHUB_REPOSITORY.git"
+      - name: Reconcile
+        env:
+          CANDIDATE: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          CHECK_NAME: Candidate validation
+          FAIL_AFTER: ${{ vars.REHEARSAL_FAIL_AFTER }}
+        run: scripts/reconcile.sh
+
+  reconcile-manual:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Configure automation identity
+        env:
+          KEY: ${{ secrets.REHEARSAL_DEPLOY_KEY }}
+        run: |
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$KEY" > "$HOME/.ssh/rehearsal"
+          chmod 0600 "$HOME/.ssh/rehearsal"
+          ssh-keyscan github.com > "$HOME/.ssh/known_hosts" 2>/dev/null
+          printf 'Host github.com\n  IdentityFile ~/.ssh/rehearsal\n  IdentitiesOnly yes\n' > "$HOME/.ssh/config"
+          git remote set-url origin "git@github.com:$GITHUB_REPOSITORY.git"
+      - name: Reconcile
+        env:
+          CANDIDATE: ${{ inputs.candidate_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pull_request_number }}
+          CHECK_NAME: Candidate validation
+          FAIL_AFTER: ${{ vars.REHEARSAL_FAIL_AFTER }}
+        run: scripts/reconcile.sh
